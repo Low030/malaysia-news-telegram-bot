@@ -13,7 +13,7 @@ import requests
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 GH_TOKEN = os.getenv("GH_TOKEN")
-MESSAGE_FOOTER = (os.getenv("MESSAGE_FOOTER") or "<b>每日要闻</b>").strip()
+MESSAGE_FOOTER_RAW = (os.getenv("MESSAGE_FOOTER") or "每日要闻").strip()
 
 HISTORY_FILE = Path("news_pushed_history.json")
 MAX_CANDIDATES = 20
@@ -35,6 +35,18 @@ MODEL_NAMES = ["openai/gpt-4o-mini", "gpt-4o-mini"]
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"})
+
+
+def normalize_footer(raw: str) -> str:
+    """统一尾缀为 HTML 粗体"""
+    t = raw.strip()
+    t = t.replace("**", "")
+    t = re.sub(r"</?b>", "", t, flags=re.I)
+    t = strip_html(t).strip() or "每日要闻"
+    return f"<b>{escape(t)}</b>"
+
+
+MESSAGE_FOOTER = normalize_footer(MESSAGE_FOOTER_RAW)
 
 
 def load_history() -> set:
@@ -145,7 +157,7 @@ def guess_category(title: str, summary: str) -> str:
         return "#校园新闻"
     if any(k in text for k in ["economy", "bank", "inflation", "subsidy", "price", "job", "经济", "民生", "油价"]):
         return "#经济民生"
-    if any(k in text for k in ["minister", "prime minister", "parliament", "election", "party", "政治", "首相", "部长", "选举"]):
+    if any(k in text for k in ["minister", "prime minister", "parliament", "election", "party", "pm ", "政治", "首相", "部长", "选举", "anwar"]):
         return "#政治讨论"
     return "#社会热点"
 
@@ -154,34 +166,82 @@ def contains_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
 
+def cjk_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    letters = len(re.findall(r"[A-Za-z\u4e00-\u9fff]", text))
+    if letters == 0:
+        return 0.0
+    return cjk / letters
+
+
 def is_valid_message(text: str) -> bool:
     if not text:
         return False
-    t = text.strip()
-    if len(t) < 40:
+    t = strip_html(text).strip()
+    if len(t) < 30:
         return False
-    if t.upper() in {"OK", "OK.", "YES", "SUCCESS", "DONE"}:
+    if t.upper() in {"OK", "YES", "DONE"}:
         return False
-    if "信息来源" not in t:
+    if "信息来源" not in text:
         return False
-    if not contains_cjk(t):
+    # 正文必须明显是中文（允许少量英文专有名词）
+    if cjk_ratio(t) < 0.35:
         return False
     return True
+
+
+def translate_to_zh(text: str) -> str | None:
+    """免费翻译兜底：英文/马来文 -> 简体中文"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if contains_cjk(text) and cjk_ratio(text) > 0.5:
+        return text
+
+    # 分段，避免超长
+    chunk = text[:450]
+    for langpair in ("en|zh-CN", "ms|zh-CN", "auto|zh-CN"):
+        try:
+            resp = SESSION.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": chunk, "langpair": langpair},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            translated = (data.get("responseData") or {}).get("translatedText") or ""
+            translated = strip_html(translated).strip()
+            # MyMemory 失败时有时原样返回
+            if translated and contains_cjk(translated) and cjk_ratio(translated) > 0.35:
+                print(f"[Info] 翻译成功 langpair={langpair}")
+                return translated
+        except Exception as e:
+            print(f"[Warn] 翻译异常: {e}")
+    return None
 
 
 def format_html_message(title_zh: str, category: str, body_zh: str, source: str, link: str) -> str:
     today_str = datetime.now(timezone.utc).strftime("%Y年%m月%d日")
     title_zh = strip_html(title_zh).strip() or "今日要闻"
     body_zh = strip_html(body_zh).strip()
-    if len(body_zh) > 400:
-        body_zh = body_zh[:400].rstrip() + "…"
-    for j in ["本条为系统根据公开报道整理的重点资讯", "建议结合原文了解完整细节与后续进展"]:
+    body_zh = re.sub(r"\s+", " ", body_zh)
+    if len(body_zh) > 380:
+        body_zh = body_zh[:380].rstrip() + "…"
+
+    for j in [
+        "本条为系统根据公开报道整理的重点资讯",
+        "建议结合原文了解完整细节与后续进展",
+        "完整细节请查看原文链接",
+    ]:
         body_zh = body_zh.replace(j, "")
-    body_zh = re.sub(r"\n{3,}", "\n\n", body_zh).strip()
+    body_zh = body_zh.strip()
 
     return (
         f"<b>{escape(title_zh)}</b>\n"
-        f"{escape(category)}\n"
+        f"{escape(category)}\n\n"
         f"<b><i><u>{today_str}</u></i></b>\n\n"
         f"{escape(body_zh)}\n\n"
         f"信息来源：<a href=\"{escape(link, quote=True)}\">{escape(source)}</a>\n\n"
@@ -202,12 +262,16 @@ def call_github_models(prompt: str, max_tokens: int = 700):
         for model in MODEL_NAMES:
             payload = {
                 "model": model,
-                "temperature": 0.3,
+                "temperature": 0.2,
                 "max_tokens": max_tokens,
                 "messages": [
                     {
                         "role": "system",
-                        "content": "你是马来西亚中文新闻编辑。只输出中文内容，禁止回复 OK/Yes/Done，禁止输出英文正文。",
+                        "content": (
+                            "你是马来西亚中文新闻编辑。必须输出简体中文。"
+                            "人名、政党、机构名可保留原文。"
+                            "禁止回复 OK/Yes/Done，禁止整段英文或马来文。"
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],
@@ -236,26 +300,27 @@ def call_github_models(prompt: str, max_tokens: int = 700):
                 if isinstance(content, str):
                     content = content.strip()
                     print(f"[Info] AI 前80字: {content[:80]!r}")
-                    if content and content.upper() not in {"OK", "YES", "DONE"} and contains_cjk(content):
+                    if content.upper() in {"OK", "YES", "DONE"}:
+                        continue
+                    if contains_cjk(content) and cjk_ratio(content) >= 0.35:
                         return content
-                    print("[Warn] AI 返回无效/非中文")
             except Exception as e:
                 print(f"[Warn] 模型异常: {e}")
     return None
 
 
 def ai_rewrite_one(item: dict):
-    prompt = f"""请把下面这则新闻改写成中文推送素材。
+    prompt = f"""把下面新闻改写成简体中文推送素材。
+人名/政党/机构可保留原文，其余必须中文。
 
-标题: {item['title']}
+原标题: {item['title']}
 来源: {item['source']}
-链接: {item['link']}
-摘要: {item['summary'][:350]}
+摘要: {item['summary'][:320]}
 
-请严格按下面 3 行格式输出（不要多写）：
+只输出以下 3 行：
 分类:#政治讨论 或 #校园新闻 或 #经济民生 或 #社会热点
-标题:中文标题（简短有力）
-正文:两段中文，第一段核心事实，第二段背景影响。不要出现「本条为系统」这类套话。
+标题:中文标题
+正文:两段中文。第一段说清谁、发生了什么；第二段补充背景或影响。不要套话。
 """
     raw = call_github_models(prompt, max_tokens=500)
     if not raw:
@@ -263,45 +328,47 @@ def ai_rewrite_one(item: dict):
 
     category, title_zh, body_zh = "#社会热点", "", ""
     for line in raw.splitlines():
-        line = line.strip()
-        if line.startswith("分类:"):
-            category = line.replace("分类:", "", 1).strip() or category
-        elif line.startswith("标题:"):
-            title_zh = line.replace("标题:", "", 1).strip()
-        elif line.startswith("正文:"):
-            body_zh = line.replace("正文:", "", 1).strip()
+        s = line.strip()
+        if s.startswith("分类:"):
+            category = s.replace("分类:", "", 1).strip() or category
+        elif s.startswith("标题:"):
+            title_zh = s.replace("标题:", "", 1).strip()
+        elif s.startswith("正文:"):
+            body_zh = s.replace("正文:", "", 1).strip()
 
     if not title_zh or not body_zh:
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         if not title_zh and lines:
-            title_zh = re.sub(r"^标题[:：]\s*", "", lines[0])
+            title_zh = re.sub(r"^(标题[:：]\s*)", "", lines[0])
         if not body_zh and len(lines) > 1:
             body_zh = "\n".join(lines[1:])
 
-    if not contains_cjk(title_zh) or not contains_cjk(body_zh):
+    if cjk_ratio(title_zh) < 0.3 or cjk_ratio(body_zh) < 0.35:
         return None
     if category not in {"#政治讨论", "#校园新闻", "#经济民生", "#社会热点"}:
         category = guess_category(item["title"], item["summary"])
     return title_zh, category, body_zh
 
 
-def build_fallback_message(item: dict) -> str:
+def build_chinese_fallback(item: dict) -> str | None:
+    """AI 失败时：翻译成中文后再排版，绝不直接贴马来文/英文长句"""
     category = guess_category(item.get("title", ""), item.get("summary", ""))
-    title = item.get("title") or "今日要闻"
+    title = item.get("title") or ""
     summary = item.get("summary") or ""
 
-    if contains_cjk(title) and contains_cjk(summary):
-        title_zh, body_zh = title, summary
-    elif contains_cjk(title):
-        title_zh = title
-        body_zh = summary if contains_cjk(summary) else f"据 {item.get('source', '媒体')} 报道，相关事件仍在持续发展中，详情见原文。"
-    else:
-        title_zh = f"国际要闻：{title[:40]}" if len(title) > 40 else f"国际要闻：{title}"
-        body_zh = (
-            f"据 {item.get('source', '外媒')} 报道，{title}。"
-            + (f" {summary[:160]}" if summary else "")
-            + " 完整细节请查看原文链接。"
-        )
+    title_zh = translate_to_zh(title)
+    body_src = summary if summary else title
+    body_zh = translate_to_zh(body_src)
+
+    if not title_zh or not body_zh:
+        print("[Warn] 翻译兜底失败")
+        return None
+
+    # 二次校验中文比例
+    if cjk_ratio(title_zh) < 0.3:
+        title_zh = "今日马来西亚要闻"
+    if cjk_ratio(body_zh) < 0.35:
+        body_zh = f"据{item.get('source', '媒体')}报道，相关事件引发关注。更多细节请点击原文。"
 
     return format_html_message(
         title_zh=title_zh,
@@ -333,9 +400,13 @@ def generate_telegram_message(candidates: list):
             if is_valid_message(msg):
                 return msg, item["id"], item.get("image_url")
 
-    print("[Warn] AI 中文改写失败，使用本地模板")
-    selected = ordered[0]
-    return build_fallback_message(selected), selected["id"], selected.get("image_url")
+    print("[Warn] AI 不可用，启用中文翻译兜底")
+    for item in ordered[:5]:
+        msg = build_chinese_fallback(item)
+        if msg and is_valid_message(msg):
+            return msg, item["id"], item.get("image_url")
+
+    return None, None, None
 
 
 def send_text_only(token: str, chat_id: str, text: str) -> bool:
@@ -357,7 +428,7 @@ def send_text_only(token: str, chat_id: str, text: str) -> bool:
 
 def send_telegram_message(token: str, chat_id: str, text: str, image_url=None) -> bool:
     if not is_valid_message(text):
-        print("[Error] 拒绝发送无效文案:", repr(text[:100]))
+        print("[Error] 拒绝发送非中文/无效文案:", repr(strip_html(text)[:120]))
         return False
 
     caption = text if len(text) <= 1024 else text[:1000] + "…"
@@ -383,7 +454,7 @@ def send_telegram_message(token: str, chat_id: str, text: str, image_url=None) -
 def main() -> int:
     try:
         if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GH_TOKEN]):
-            print("[Error] 缺少 Secrets: TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID / GH_TOKEN")
+            print("[Error] 缺少 Secrets")
             return 0
 
         print("=== 马来西亚每日重点新闻推送 开始 ===")
@@ -393,20 +464,20 @@ def main() -> int:
         print(f"已推送历史数: {len(pushed_ids)}")
 
         candidates = fetch_candidates()
-        print(f"候选新闻数: {len(candidates)} | 带图: {sum(1 for c in candidates if c.get('image_url'))}")
+        print(f"候选: {len(candidates)} | 带图: {sum(1 for c in candidates if c.get('image_url'))}")
 
         candidates = [c for c in candidates if c["id"] not in pushed_ids]
         print(f"去重后: {len(candidates)}")
         if not candidates:
-            print("今日无新候选，正常结束。")
+            print("今日无新候选")
             return 0
 
         message, selected_id, image_url = generate_telegram_message(candidates)
         if not message:
-            print("[Error] 文案生成失败")
+            print("[Error] 无法生成合格中文文案，取消发送")
             return 0
 
-        print("文案预览:\n", message[:500], "...")
+        print("文案预览:\n", message[:500])
         print(f"配图: {image_url or '无'}")
 
         success = send_telegram_message(
@@ -415,14 +486,14 @@ def main() -> int:
         if success and selected_id:
             pushed_ids.add(selected_id)
             save_history(pushed_ids)
-            print(f"已记录去重 ID: {selected_id}")
+            print(f"已记录: {selected_id}")
         else:
             print("推送失败，未写入历史")
 
         print("=== 运行结束 ===")
         return 0
     except Exception as e:
-        print(f"[Error] 未捕获异常: {e}")
+        print(f"[Error] {e}")
         traceback.print_exc()
         return 0
 
