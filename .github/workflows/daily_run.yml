@@ -32,6 +32,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          MESSAGE_FOOTER: ${{ secrets.MESSAGE_FOOTER }}
         run: python main.py
 
       - name: Commit and push history
