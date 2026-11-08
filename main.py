@@ -37,9 +37,16 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"})
 
 
+def strip_html(text: str) -> str:
+    if not text:
+        return ""
+    text = unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def normalize_footer(raw: str) -> str:
-    """统一尾缀为 HTML 粗体"""
-    t = raw.strip()
+    t = (raw or "").strip()
     t = t.replace("**", "")
     t = re.sub(r"</?b>", "", t, flags=re.I)
     t = strip_html(t).strip() or "每日要闻"
@@ -82,14 +89,6 @@ def parse_entry_time(entry):
             except Exception:
                 pass
     return None
-
-
-def strip_html(text: str) -> str:
-    if not text:
-        return ""
-    text = unescape(text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def extract_image_url(entry):
@@ -179,28 +178,25 @@ def cjk_ratio(text: str) -> float:
 def is_valid_message(text: str) -> bool:
     if not text:
         return False
-    t = strip_html(text).strip()
-    if len(t) < 30:
+    plain = strip_html(text).strip()
+    if len(plain) < 30:
         return False
-    if t.upper() in {"OK", "YES", "DONE"}:
+    if plain.upper() in {"OK", "YES", "DONE"}:
         return False
     if "信息来源" not in text:
         return False
-    # 正文必须明显是中文（允许少量英文专有名词）
-    if cjk_ratio(t) < 0.35:
+    if cjk_ratio(plain) < 0.35:
         return False
     return True
 
 
-def translate_to_zh(text: str) -> str | None:
-    """免费翻译兜底：英文/马来文 -> 简体中文"""
+def translate_to_zh(text: str):
     text = (text or "").strip()
     if not text:
         return None
     if contains_cjk(text) and cjk_ratio(text) > 0.5:
         return text
 
-    # 分段，避免超长
     chunk = text[:450]
     for langpair in ("en|zh-CN", "ms|zh-CN", "auto|zh-CN"):
         try:
@@ -211,10 +207,8 @@ def translate_to_zh(text: str) -> str | None:
             )
             if resp.status_code != 200:
                 continue
-            data = resp.json()
-            translated = (data.get("responseData") or {}).get("translatedText") or ""
-            translated = strip_html(translated).strip()
-            # MyMemory 失败时有时原样返回
+            translated = ((resp.json().get("responseData") or {}).get("translatedText") or "").strip()
+            translated = strip_html(translated)
             if translated and contains_cjk(translated) and cjk_ratio(translated) > 0.35:
                 print(f"[Info] 翻译成功 langpair={langpair}")
                 return translated
@@ -249,15 +243,24 @@ def format_html_message(title_zh: str, category: str, body_zh: str, source: str,
     )
 
 
-def call_github_models(prompt: str, max_tokens: int = 700):
+def call_github_models(user_prompt: str, max_tokens: int = 700):
     if not GH_TOKEN:
         return None
+
     headers = {
         "Authorization": f"Bearer {GH_TOKEN}",
         "Content-Type": "application/json",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+    # 正向约束：不使用否定句式，减少模型只回短确认词的概率
+    system_prompt = (
+        "你是马来西亚简体中文新闻编辑。"
+        "你的每一次回复都必须是可直接发布的中文新闻成品。"
+        "人名、政党、机构名称可以保留原文，其余内容使用简体中文。"
+    )
+
     for endpoint in MODEL_ENDPOINTS:
         for model in MODEL_NAMES:
             payload = {
@@ -265,15 +268,8 @@ def call_github_models(prompt: str, max_tokens: int = 700):
                 "temperature": 0.2,
                 "max_tokens": max_tokens,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是马来西亚中文新闻编辑。必须输出简体中文。"
-                            "人名、政党、机构名可保留原文。"
-                            "禁止回复 OK/Yes/Done，禁止整段英文或马来文。"
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
             }
             try:
@@ -310,21 +306,27 @@ def call_github_models(prompt: str, max_tokens: int = 700):
 
 
 def ai_rewrite_one(item: dict):
-    prompt = f"""把下面新闻改写成简体中文推送素材。
-人名/政党/机构可保留原文，其余必须中文。
+    # 强约束前缀：先给出必须遵守的输出格式，再给材料
+    user_prompt = f"""请严格按下面格式输出三行中文结果：
+分类:#政治讨论
+标题:这里写中文标题
+正文:这里写两段中文正文，第一段写核心事实，第二段写背景或影响
 
+材料如下：
 原标题: {item['title']}
 来源: {item['source']}
 摘要: {item['summary'][:320]}
 
-只输出以下 3 行：
-分类:#政治讨论 或 #校园新闻 或 #经济民生 或 #社会热点
-标题:中文标题
-正文:两段中文。第一段说清谁、发生了什么；第二段补充背景或影响。不要套话。
-"""
-    raw = call_github_models(prompt, max_tokens=500)
+开始输出：
+分类:"""
+
+    raw = call_github_models(user_prompt, max_tokens=500)
     if not raw:
         return None
+
+    # 若模型没有带上“分类:”前缀，补回去便于解析
+    if not raw.lstrip().startswith("分类"):
+        raw = "分类:" + raw
 
     category, title_zh, body_zh = "#社会热点", "", ""
     for line in raw.splitlines():
@@ -339,7 +341,7 @@ def ai_rewrite_one(item: dict):
     if not title_zh or not body_zh:
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         if not title_zh and lines:
-            title_zh = re.sub(r"^(标题[:：]\s*)", "", lines[0])
+            title_zh = re.sub(r"^(分类|标题)[:：]\s*", "", lines[0])
         if not body_zh and len(lines) > 1:
             body_zh = "\n".join(lines[1:])
 
@@ -350,8 +352,7 @@ def ai_rewrite_one(item: dict):
     return title_zh, category, body_zh
 
 
-def build_chinese_fallback(item: dict) -> str | None:
-    """AI 失败时：翻译成中文后再排版，绝不直接贴马来文/英文长句"""
+def build_chinese_fallback(item: dict):
     category = guess_category(item.get("title", ""), item.get("summary", ""))
     title = item.get("title") or ""
     summary = item.get("summary") or ""
@@ -364,7 +365,6 @@ def build_chinese_fallback(item: dict) -> str | None:
         print("[Warn] 翻译兜底失败")
         return None
 
-    # 二次校验中文比例
     if cjk_ratio(title_zh) < 0.3:
         title_zh = "今日马来西亚要闻"
     if cjk_ratio(body_zh) < 0.35:
@@ -400,7 +400,7 @@ def generate_telegram_message(candidates: list):
             if is_valid_message(msg):
                 return msg, item["id"], item.get("image_url")
 
-    print("[Warn] AI 不可用，启用中文翻译兜底")
+    print("[Warn] 启用中文翻译兜底")
     for item in ordered[:5]:
         msg = build_chinese_fallback(item)
         if msg and is_valid_message(msg):
