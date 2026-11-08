@@ -2,7 +2,7 @@ name: Daily Malaysia News Push
 
 on:
   schedule:
-    # 每天 UTC 02:00（北京时间 10:00）运行一次
+    # 每天 UTC 02:00（北京时间 10:00）
     - cron: "0 2 * * *"
   workflow_dispatch:
 
@@ -12,15 +12,18 @@ permissions:
 jobs:
   push-news:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
+      # 使用 3.12，避免 3.10 下载源偶发 504
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
+          check-latest: false
 
       - name: Install dependencies
         run: |
