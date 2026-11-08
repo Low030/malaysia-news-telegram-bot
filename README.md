@@ -1,8 +1,6 @@
 # 马来西亚每日重点新闻 → Telegram 推送机器人
 
-每天自动从马来西亚主流媒体抓取新闻，使用 AI 选出当天最重要的一条，按固定排版推送到 Telegram 频道 **@ISAYNEWS**。
-
-风格与实现参考：[github-trending-telegram-bot](https://github.com/Low030/github-trending-telegram-bot)
+每天自动从马来西亚主流媒体抓取新闻，使用 AI 选出当天最重要的一条，按固定排版推送到 Telegram 频道
 
 ## 功能特点
 
@@ -42,7 +40,7 @@
 | Secret 名称 | 说明 |
 |-------------|------|
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token |
-| `TELEGRAM_CHANNEL_ID` | 频道 ID（推荐 `-100xxxxxxxxxx`）或 `@ISAYNEWS` |
+| `TELEGRAM_CHANNEL_ID` | 频道 ID（推荐 `-100xxxxxxxxxx`） |
 | `GH_TOKEN` | GitHub PAT（需 `models:read` 权限，用于调用 GitHub Models） |
 
 ### 2. Telegram 频道设置
