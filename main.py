@@ -2,6 +2,7 @@ import os
 import json
 import re
 import hashlib
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,15 +17,20 @@ GH_TOKEN = os.getenv("GH_TOKEN")
 MESSAGE_FOOTER_RAW = (os.getenv("MESSAGE_FOOTER") or "每日要闻").strip()
 
 HISTORY_FILE = Path("news_pushed_history.json")
-MAX_CANDIDATES = 20
-HOURS_WINDOW = 36
-AI_CANDIDATE_LIMIT = 6
+MAX_CANDIDATES = 40
+HOURS_WINDOW = 24
+# 每次运行最多推送几篇（配合更频繁的定时任务实现准即时效果）
+MAX_PUSH_PER_RUN = int(os.getenv("MAX_PUSH_PER_RUN") or "3")
+AI_TRY_PER_ITEM = 1
 
 RSS_FEEDS = [
     {"name": "Bernama", "url": "https://www.bernama.com/en/rssfeed.php/"},
     {"name": "The Star", "url": "https://www.thestar.com.my/rss/news/nation"},
     {"name": "Free Malaysia Today", "url": "https://www.freemalaysiatoday.com/feed"},
     {"name": "Malaysiakini", "url": "https://www.malaysiakini.com/en/rss"},
+    {"name": "Malay Mail", "url": "https://www.malaymail.com/feed"},
+    {"name": "Google News MY EN", "url": "https://news.google.com/rss?hl=en-MY&gl=MY&ceid=MY:en"},
+    {"name": "Google News MY ZH", "url": "https://news.google.com/rss?hl=zh-CN&gl=MY&ceid=MY:zh-Hans"},
 ]
 
 MODEL_ENDPOINTS = [
@@ -69,7 +75,7 @@ def load_history() -> set:
 
 def save_history(pushed_ids: set) -> None:
     data = {
-        "pushed_ids": sorted(list(pushed_ids))[-500:],
+        "pushed_ids": sorted(list(pushed_ids))[-800:],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -124,7 +130,7 @@ def fetch_candidates() -> list:
             if not feed.entries:
                 print(f"[Warn] RSS 无条目: {name}")
                 continue
-            for entry in feed.entries[:15]:
+            for entry in feed.entries[:12]:
                 link = (entry.get("link") or "").strip()
                 title = (entry.get("title") or "").strip()
                 if not title or not link or link in seen:
@@ -154,7 +160,7 @@ def guess_category(title: str, summary: str) -> str:
     text = f"{title} {summary}".lower()
     if any(k in text for k in ["school", "student", "university", "campus", "教育", "校园", "学生"]):
         return "#校园新闻"
-    if any(k in text for k in ["economy", "bank", "inflation", "subsidy", "price", "job", "经济", "民生", "油价"]):
+    if any(k in text for k in ["economy", "bank", "inflation", "subsidy", "price", "job", "经济", "民生", "油价", "投资"]):
         return "#经济民生"
     if any(k in text for k in ["minister", "prime minister", "parliament", "election", "party", "pm ", "政治", "首相", "部长", "选举", "anwar"]):
         return "#政治讨论"
@@ -184,6 +190,8 @@ def is_valid_message(text: str) -> bool:
     if plain.upper() in {"OK", "YES", "DONE"}:
         return False
     if "信息来源" not in text:
+        return False
+    if "#每日新闻" not in text:
         return False
     if cjk_ratio(plain) < 0.35:
         return False
@@ -218,6 +226,18 @@ def translate_to_zh(text: str):
 
 
 def format_html_message(title_zh: str, category: str, body_zh: str, source: str, link: str) -> str:
+    """
+    <b>中文标题</b>
+    #每日新闻 #分类
+
+    <b><i><u>日期</u></i></b>
+
+    中文正文
+
+    信息来源：可点击链接
+
+    <b>尾缀</b>
+    """
     today_str = datetime.now(timezone.utc).strftime("%Y年%m月%d日")
     title_zh = strip_html(title_zh).strip() or "今日要闻"
     body_zh = strip_html(body_zh).strip()
@@ -233,9 +253,12 @@ def format_html_message(title_zh: str, category: str, body_zh: str, source: str,
         body_zh = body_zh.replace(j, "")
     body_zh = body_zh.strip()
 
+    if category not in {"#政治讨论", "#校园新闻", "#经济民生", "#社会热点"}:
+        category = "#社会热点"
+
     return (
         f"<b>{escape(title_zh)}</b>\n"
-        f"{escape(category)}\n\n"
+        f"#每日新闻 {escape(category)}\n\n"
         f"<b><i><u>{today_str}</u></i></b>\n\n"
         f"{escape(body_zh)}\n\n"
         f"信息来源：<a href=\"{escape(link, quote=True)}\">{escape(source)}</a>\n\n"
@@ -254,7 +277,6 @@ def call_github_models(user_prompt: str, max_tokens: int = 700):
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    # 正向约束：不使用否定句式，减少模型只回短确认词的概率
     system_prompt = (
         "你是马来西亚简体中文新闻编辑。"
         "你的每一次回复都必须是可直接发布的中文新闻成品。"
@@ -306,7 +328,6 @@ def call_github_models(user_prompt: str, max_tokens: int = 700):
 
 
 def ai_rewrite_one(item: dict):
-    # 强约束前缀：先给出必须遵守的输出格式，再给材料
     user_prompt = f"""请严格按下面格式输出三行中文结果：
 分类:#政治讨论
 标题:这里写中文标题
@@ -324,7 +345,6 @@ def ai_rewrite_one(item: dict):
     if not raw:
         return None
 
-    # 若模型没有带上“分类:”前缀，补回去便于解析
     if not raw.lstrip().startswith("分类"):
         raw = "分类:" + raw
 
@@ -379,34 +399,24 @@ def build_chinese_fallback(item: dict):
     )
 
 
-def generate_telegram_message(candidates: list):
-    if not candidates:
-        return None, None, None
+def build_one_message(item: dict):
+    rewritten = ai_rewrite_one(item)
+    if rewritten:
+        title_zh, category, body_zh = rewritten
+        msg = format_html_message(
+            title_zh=title_zh,
+            category=category,
+            body_zh=body_zh,
+            source=item.get("source", "媒体"),
+            link=item.get("link", ""),
+        )
+        if is_valid_message(msg):
+            return msg
 
-    short_list = candidates[:AI_CANDIDATE_LIMIT]
-    ordered = sorted(short_list, key=lambda x: (0 if x.get("image_url") else 1))
-
-    for item in ordered[:3]:
-        rewritten = ai_rewrite_one(item)
-        if rewritten:
-            title_zh, category, body_zh = rewritten
-            msg = format_html_message(
-                title_zh=title_zh,
-                category=category,
-                body_zh=body_zh,
-                source=item.get("source", "媒体"),
-                link=item.get("link", ""),
-            )
-            if is_valid_message(msg):
-                return msg, item["id"], item.get("image_url")
-
-    print("[Warn] 启用中文翻译兜底")
-    for item in ordered[:5]:
-        msg = build_chinese_fallback(item)
-        if msg and is_valid_message(msg):
-            return msg, item["id"], item.get("image_url")
-
-    return None, None, None
+    msg = build_chinese_fallback(item)
+    if msg and is_valid_message(msg):
+        return msg
+    return None
 
 
 def send_text_only(token: str, chat_id: str, text: str) -> bool:
@@ -457,8 +467,9 @@ def main() -> int:
             print("[Error] 缺少 Secrets")
             return 0
 
-        print("=== 马来西亚每日重点新闻推送 开始 ===")
+        print("=== 马来西亚新闻推送 开始 ===")
         print(f"时间: {datetime.now(timezone.utc).isoformat()}")
+        print(f"本轮最多推送: {MAX_PUSH_PER_RUN} 篇")
 
         pushed_ids = load_history()
         print(f"已推送历史数: {len(pushed_ids)}")
@@ -469,27 +480,40 @@ def main() -> int:
         candidates = [c for c in candidates if c["id"] not in pushed_ids]
         print(f"去重后: {len(candidates)}")
         if not candidates:
-            print("今日无新候选")
+            print("本轮无新候选")
             return 0
 
-        message, selected_id, image_url = generate_telegram_message(candidates)
-        if not message:
-            print("[Error] 无法生成合格中文文案，取消发送")
-            return 0
+        # 优先有图的新闻
+        ordered = sorted(candidates, key=lambda x: (0 if x.get("image_url") else 1))
 
-        print("文案预览:\n", message[:500])
-        print(f"配图: {image_url or '无'}")
+        success_count = 0
+        for item in ordered:
+            if success_count >= MAX_PUSH_PER_RUN:
+                break
 
-        success = send_telegram_message(
-            TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, message, image_url=image_url
-        )
-        if success and selected_id:
-            pushed_ids.add(selected_id)
-            save_history(pushed_ids)
-            print(f"已记录: {selected_id}")
-        else:
-            print("推送失败，未写入历史")
+            print(f"\n处理: {item['title'][:80]} | {item['source']}")
+            message = build_one_message(item)
+            if not message:
+                print("[Warn] 文案生成失败，跳过")
+                continue
 
+            print("文案预览:\n", message[:400])
+            ok = send_telegram_message(
+                TELEGRAM_BOT_TOKEN,
+                TELEGRAM_CHANNEL_ID,
+                message,
+                image_url=item.get("image_url"),
+            )
+            if ok:
+                pushed_ids.add(item["id"])
+                success_count += 1
+                save_history(pushed_ids)
+                print(f"[Success] 已推送 {success_count}/{MAX_PUSH_PER_RUN}")
+                time.sleep(2)
+            else:
+                print("[Warn] 推送失败，未记入历史")
+
+        print(f"\n本轮成功推送 {success_count} 篇")
         print("=== 运行结束 ===")
         return 0
     except Exception as e:

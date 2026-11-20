@@ -1,9 +1,10 @@
-name: Daily Malaysia News Push
+name: Malaysia News Push
 
 on:
   schedule:
-    # 每天 UTC 02:00（北京时间 10:00）
-    - cron: "0 2 * * *"
+    # 每天多次运行，实现准即时效果（UTC）
+    # 北京时间约：08:00 / 12:00 / 16:00 / 20:00 / 00:00
+    - cron: "0 0,4,8,12,16 * * *"
   workflow_dispatch:
 
 permissions:
@@ -12,13 +13,12 @@ permissions:
 jobs:
   push-news:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 使用 3.12，避免 3.10 下载源偶发 504
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -36,6 +36,7 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           MESSAGE_FOOTER: ${{ secrets.MESSAGE_FOOTER }}
+          MAX_PUSH_PER_RUN: "3"
         run: python main.py
 
       - name: Commit and push history
